@@ -24,6 +24,7 @@ const MODEL = process.env.BOT_MODEL || "openai";
 const MIN_GAP_MS = 4000;
 const TIMEOUT_MS = 12000;
 const MAX_CALLS_PER_ROUND = 6;
+const MAX_GUESSES_PER_ROUND = 3;
 
 const DRAW_SYSTEM = [
   "You are Polli, a player in a drawing game. You draw a word using only geometric shapes.",
@@ -116,10 +117,15 @@ function cleanGuess(text) {
   return w.length ? w[w.length - 1] : "";
 }
 
-/* A word of the right shape, for when no model answers. */
-function blindGuess(wordLength) {
-  const same = G.WORDS.filter(w => w.length === wordLength);
-  return same.length ? same[Math.floor(Math.random() * same.length)] : "";
+/* A word the bot has not already said this round, preferring the right
+   length, so a repeated guess never clutters the board. */
+function freshGuess(wordLength, already) {
+  const said = {};
+  (already || []).forEach(g => { said[String(g).toLowerCase()] = true; });
+  const same = G.WORDS.filter(w => !said[w] && w.length === wordLength);
+  const any = G.WORDS.filter(w => !said[w]);
+  const pick = same.length ? same : any;
+  return pick.length ? pick[Math.floor(Math.random() * pick.length)] : "";
 }
 
 /* Decide, then write. Returns true when the match changed. */
@@ -133,30 +139,32 @@ async function step(bearer) {
     return { doc: doc, result: { changed: before !== JSON.stringify(m), act: due } };
   });
   if (!act.act) return act.changed;
+  const turn = act.act;
 
   let shapes = [];
   let guess = "";
-  if (act.act.drawing) {
-    const text = await ask(DRAW_SYSTEM, 'Draw the word: "' + act.act.word + '". Reply with the JSON array only.', 600, bearer);
+  if (turn.drawing) {
+    const text = await ask(DRAW_SYSTEM, 'Draw the word: "' + turn.word + '". Reply with the JSON array only.', 600, bearer);
     shapes = parseShapes(text);
-    if (!shapes.length) shapes = fallbackDrawing(act.act.word);
+    if (!shapes.length) shapes = fallbackDrawing(turn.word);
   } else {
-    const text = await ask(GUESS_SYSTEM, "A " + act.act.wordLength + " letter word. Shapes: " + act.act.shapes + ". Answer with one word.", 24, bearer);
-    guess = cleanGuess(text) || blindGuess(act.act.wordLength);
+    const text = await ask(GUESS_SYSTEM, "A " + turn.wordLength + " letter word. Shapes: " + turn.shapes + ". Answer with one word.", 24, bearer);
+    guess = cleanGuess(text);
+    if (!guess || turn.said.indexOf(guess) !== -1) guess = freshGuess(turn.wordLength, turn.said);
     if (!guess) return true;
   }
 
   return S.withDoc(doc => {
     const m = G.ensureMatch(doc, "arena");
     G.tick(m);
-    if (m.status !== "playing" || m.roundNo !== act.act.round) return { doc: doc, result: true };
-    if (act.act.drawing) {
+    if (m.status !== "playing" || m.roundNo !== turn.round) return { doc: doc, result: true };
+    if (turn.drawing) {
       for (const s of shapes) {
         if (m.shapes.length >= G.MAX_SHAPES) break;
         m.shapes.push(s);
       }
     } else {
-      G.guess(m, act.act.botToken, guess);
+      G.guess(m, turn.botToken, guess);
     }
     G.tick(m);
     m.updatedAt = Date.now();
@@ -171,7 +179,7 @@ function dueNow(m, bot) {
   if (Date.now() - (m.botAt || 0) < MIN_GAP_MS) return null;
   const drawing = bot.id === m.drawer;
   if (drawing ? m.shapes.length >= 6 : m.shapes.length < 2) return null;
-  if (!drawing && (m.botGuesses || 0) >= 3) return null;
+  if (!drawing && (m.botGuesses || 0) >= MAX_GUESSES_PER_ROUND) return null;
   m.botAt = Date.now();
   m.botCalls = (m.botCalls || 0) + 1;
   if (!drawing) m.botGuesses = (m.botGuesses || 0) + 1;
@@ -181,7 +189,8 @@ function dueNow(m, bot) {
     drawing: drawing,
     word: drawing ? m.word : null,
     wordLength: m.word ? m.word.length : 0,
-    shapes: m.shapes.map(G.shapeLine).join("; ").slice(0, 700)
+    shapes: m.shapes.map(G.shapeLine).join("; ").slice(0, 700),
+    said: m.guesses.filter(g => g.player === bot.name).map(g => String(g.text).toLowerCase())
   };
 }
 
@@ -196,4 +205,4 @@ function seat(m) {
   return m;
 }
 
-module.exports = { step, seat, botPlayer, parseShapes, fallbackDrawing, cleanGuess, blindGuess, hasKey: () => Boolean(POLL_KEY) };
+module.exports = { step, seat, botPlayer, parseShapes, fallbackDrawing, cleanGuess, freshGuess, hasKey: () => Boolean(POLL_KEY) };
